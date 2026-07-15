@@ -1,0 +1,8 @@
+2026-07-15 16:07:46,235 [INFO] Initializing Ticket API application...
+2026-07-15 16:07:48,484 [INFO] Initializing Ticket API application...
+2026-07-15 16:14:38,226 [INFO] Incoming ticket request received for customer: 'John' (doxaberlin@gmail.com)
+2026-07-15 16:14:38,226 [INFO] Successfully generated unique Ticket ID: 0c4d8cf7-b26e-4e28-a7a3-c4407cd8e9da
+2026-07-15 16:14:38,227 [INFO] Ticket 0c4d8cf7-b26e-4e28-a7a3-c4407cd8e9da successfully saved to memory database.
+2026-07-15 16:14:40,085 [INFO] Incoming ticket request received for customer: 'John' (doxaberlin@gmail.com)
+2026-07-15 16:14:40,086 [INFO] Successfully generated unique Ticket ID: 61eb582a-4747-444d-b5d4-e99bc5384b96
+2026-07-15 16:14:40,087 [INFO] Ticket 61eb582a-4747-444d-b5d4-e99bc5384b96 successfully saved to memory database.
