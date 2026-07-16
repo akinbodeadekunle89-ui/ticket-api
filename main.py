@@ -1,13 +1,13 @@
 import logging
 import uuid
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, EmailStr, Field
+
 
 # ==========================================
 # 1. LOGGING CONFIGURATION (The "Flight Recorder")
 # ==========================================
-# This sets up a standardized logger. In production, logs are our eyes and ears.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -32,9 +32,6 @@ app = FastAPI(
 # ==========================================
 # 3. DATA MODELING & VALIDATION GUARDS (Pydantic)
 # ==========================================
-# Business Logic: We split the models. Customers shouldn't generate their own ID 
-# or force a status when creating a ticket. They only supply the raw data.
-
 class TicketCreate(BaseModel):
     customer_name: str = Field(
         ..., 
@@ -59,11 +56,28 @@ class TicketCreate(BaseModel):
 class Ticket(TicketCreate):
     id: str  # Generated automatically by our system
     status: str = "open"  # New tickets always default to "open"
+    priority: str 
+
+# Validation model for updates - allows updating single fields optionally
+class TicketUpdate(BaseModel):
+    issue: Optional[str] = Field(
+        None, 
+        min_length=5, 
+        description="Optional new description for the ticket issue."
+    )
+    priority: Optional[str] = Field(
+        None, 
+        description="Optional priority update. Must be: low, medium, or high."
+    )
+    status: Optional[str] = Field(
+        None, 
+        description="Optional status update. Must be: open, in-progress, resolved, or closed."
+    )
+
 
 # ==========================================
 # 4. DATABASE EMULATION (In-Memory Storage)
 # ==========================================
-# A simple list acting as our database table
 tickets_db: List[Ticket] = []
 
 # ==========================================
@@ -80,7 +94,7 @@ tickets_db: List[Ticket] = []
 def create_ticket(ticket_in: TicketCreate):
     logger.info(f"Incoming ticket request received for customer: '{ticket_in.customer_name}' ({ticket_in.email})")
     
-    # Normalize priority input to keep our data consistent
+    # 1. Normalize and Validate priority
     normalized_priority = ticket_in.priority.lower().strip()
     if normalized_priority not in ["low", "medium", "high"]:
         logger.warning(f"Invalid priority submission attempted: '{ticket_in.priority}'")
@@ -88,12 +102,11 @@ def create_ticket(ticket_in: TicketCreate):
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Priority must be 'low', 'medium', or 'high'."
         )
-    
-    # Business Logic: Assign a secure, globally unique transaction ID
+
+    # 2. Create the full Ticket object with a unique ID
     system_id = str(uuid.uuid4())
     logger.info(f"Successfully generated unique Ticket ID: {system_id}")
     
-    # Package into our storage schema
     new_ticket = Ticket(
         id=system_id,
         customer_name=ticket_in.customer_name,
@@ -102,10 +115,125 @@ def create_ticket(ticket_in: TicketCreate):
         priority=normalized_priority,
         status="open"
     )
-    
-    # Save to our database
+
+    # 3. Save to database
     tickets_db.append(new_ticket)
     logger.info(f"Ticket {system_id} successfully saved to memory database.")
     
-    # Return the validated object with its 201 Created status
-    return new_ticket
+    return new_ticket      
+
+@app.get(
+    "/tickets", 
+    response_model=List[Ticket], 
+    status_code=status.HTTP_200_OK,
+    summary="Retrieve all support tickets",
+    description="Returns a complete list of all currently active tickets in the system."
+)
+def get_all_tickets():
+    logger.info(f"Querying database. Total tickets found: {len(tickets_db)}")
+    return tickets_db
+
+@app.get(
+    "/tickets/{ticket_id}", 
+    response_model=Ticket, 
+    status_code=status.HTTP_200_OK,
+    summary="Retrieve a specific ticket by ID",
+    description="Fetch details of a single ticket using its unique UUID."
+)
+def get_ticket_by_id(ticket_id: str):
+    logger.info(f"Searching for ticket with ID: '{ticket_id}'")
+    
+    for ticket in tickets_db:
+        if ticket.id == ticket_id:
+            logger.info(f"Ticket match found for ID: '{ticket_id}'")
+            return ticket
+            
+    logger.warning(f"Ticket lookup failed. ID '{ticket_id}' not found in database.")
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail=f"Ticket with ID '{ticket_id}' was not found."
+    )
+
+@app.patch(
+    "/tickets/{ticket_id}",
+    response_model=Ticket,
+    status_code=status.HTTP_200_OK,
+    summary="Partially update an existing ticket",
+    description="Updates only the specified fields (issue, priority, status) of an existing ticket."
+)
+def update_ticket(ticket_id: str, ticket_update: TicketUpdate):
+    logger.info(f"Attempting to update ticket with ID: '{ticket_id}'")
+    
+    # 1. Locate the ticket
+    target_ticket = None
+    for ticket in tickets_db:
+        if ticket.id == ticket_id:
+            target_ticket = ticket
+            break
+            
+    if not target_ticket:
+        logger.warning(f"Update failed. ID '{ticket_id}' not found in database.")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Ticket with ID '{ticket_id}' was not found."
+        )
+    
+    # 2. Get only the fields the user provided
+    update_data = ticket_update.model_dump(exclude_unset=True)
+    if not update_data:
+        logger.info(f"No update data was provided for ticket '{ticket_id}'. Returning unchanged.")
+        return target_ticket
+
+    # 3. Validate priority if they want to change it
+    if "priority" in update_data:
+        normalized_priority = update_data["priority"].lower().strip()
+        if normalized_priority not in ["low", "medium", "high"]:
+            logger.warning(f"Invalid priority update attempt: '{update_data['priority']}'")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Priority must be 'low', 'medium', or 'high'."
+            )
+        update_data["priority"] = normalized_priority
+
+    # 4. Validate status if they want to change it
+    if "status" in update_data:
+        normalized_status = update_data["status"].lower().strip()
+        if normalized_status not in ["open", "in-progress", "resolved", "closed"]:
+            logger.warning(f"Invalid status update attempt: '{update_data['status']}'")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Status must be 'open', 'in-progress', 'resolved', or 'closed'."
+            )
+        update_data["status"] = normalized_status
+
+    # 5. Save changes
+    for key, value in update_data.items():
+        setattr(target_ticket, key, value)
+
+    logger.info(f"Ticket '{ticket_id}' successfully updated fields: {list(update_data.keys())}")
+    return target_ticket
+
+@app.delete(
+    "/tickets/{ticket_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete a ticket",
+    description="Hard deletes a ticket permanently from the database using its ID."
+)
+def delete_ticket(ticket_id: str):
+    logger.info(f"Attempting to delete ticket with ID: '{ticket_id}'")
+    
+    global tickets_db
+    initial_length = len(tickets_db)
+    
+    # Rebuild list excluding the target ID
+    tickets_db = [ticket for ticket in tickets_db if ticket.id != ticket_id]
+    
+    if len(tickets_db) == initial_length:
+        logger.warning(f"Delete failed. ID '{ticket_id}' not found in database.")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Ticket with ID '{ticket_id}' was not found."
+        )
+        
+    logger.info(f"Ticket '{ticket_id}' successfully deleted from database.")
+    return None
