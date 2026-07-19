@@ -3,6 +3,8 @@ import uuid
 from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, EmailStr, Field
+from database import get_session, engine # Import what you need from your new ficle
+
 
 
 # ==========================================
