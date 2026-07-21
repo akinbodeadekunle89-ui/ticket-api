@@ -1,12 +1,11 @@
 import logging
+
 import uuid
 from typing import List, Dict, Any, Optional
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, status, Depends
 from pydantic import BaseModel, EmailStr, Field
-from database import get_session, engine # Import what you need from your new ficle
-
-
-
+from database import get_session, engine, Session # Import what you need from your new ficle
+import httpx
 # ==========================================
 # 1. LOGGING CONFIGURATION (The "Flight Recorder")
 # ==========================================
@@ -239,3 +238,52 @@ def delete_ticket(ticket_id: str):
         
     logger.info(f"Ticket '{ticket_id}' successfully deleted from database.")
     return None
+
+WEBHOOK_URL = "https://webhook.site/e1b7bb92-bf8d-42b1-86f4-6c338de6c08d"
+
+@app.post("/tickets", response_model=Ticket, status_code=status.HTTP_201_CREATED)
+async def create_ticket(ticket_in: TicketCreate, session: Session = Depends(get_session)):
+    logger.info(f"Incoming ticket for customer: '{ticket_in.customer_name}'")
+    
+    normalized_priority = ticket_in.priority.lower().strip()
+    if normalized_priority not in ["low", "medium", "high"]:
+        raise HTTPException(status_code=400, detail="Priority must be 'low', 'medium', or 'high'.")
+
+    system_id = str(uuid.uuid4())
+    
+    db_ticket = Ticket(
+        id=system_id,
+        customer_name=ticket_in.customer_name,
+        email=ticket_in.email,
+        issue=ticket_in.issue,
+        priority=normalized_priority,
+        status="open"
+    )
+    
+    session.add(db_ticket)
+    session.commit()
+    session.refresh(db_ticket)
+    
+    logger.info(f"Ticket {system_id} successfully saved to SQLite database.")
+
+    # ========================================================
+    # NEW INTEGRATION BLOCK: Trigger an external system alert
+    # ========================================================
+    try:
+        async with httpx.AsyncClient() as client:
+            # We construct a neat payload to send to the external platform
+            payload = {
+                "event": "ticket.created",
+                "ticket_id": db_ticket.id,
+                "customer": db_ticket.customer_name,
+                "issue": db_ticket.issue,
+                "priority": db_ticket.priority
+            }
+            logger.info(f"Triggering outbound webhook integration for ticket {system_id}...")
+            await client.post(WEBHOOK_URL, json=payload, timeout=5.0)
+            logger.info("Webhook successfully dispatched.")
+    except httpx.HTTPError as exc:
+        # Crucial Integrator Step: Log the failure, but don't break the user's request
+        logger.error(f"Failed to dispatch webhook to external system: {exc}")
+
+    return db_ticket
