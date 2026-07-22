@@ -1,0 +1,32 @@
+# Python bytecode and cache files
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Git metadata
+.git/
+.gitignore
+
+# Environment variables & secrets (Loaded at runtime, not built into image)
+.env
+*.env.local
+
+# Local database files & logs
+*.db
+*.sqlite3
+api_activity.log
+
+# IDE & OS clutter
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

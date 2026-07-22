@@ -5,16 +5,24 @@ import json
 import logging
 from typing import List, Optional
 from fastapi import FastAPI, HTTPException, status, Depends, BackgroundTasks, Header, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, EmailStr, Field
 import httpx
 from sqlalchemy.orm import Session
 
-# Import database models and session dependency from database.py
-from database import get_session, engine, TicketModel
+# Import settings, database models, and session dependency
+from config import settings
+from database import get_session, TicketModel
 
 # ==========================================
-# 1. LOGGING & CONFIGURATION
+# 1. SETTINGS & CONFIGURATION
 # ==========================================
+WEBHOOK_SECRET = settings.webhook_secret
+API_KEY_SECRET = settings.api_key_secret
+WEBHOOK_URL = settings.webhook_url
+
+# Logging configuration
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -25,21 +33,43 @@ logging.basicConfig(
 )
 logger = logging.getLogger("enterprise-integration-api")
 
-# Configuration Constants (In production, load these from environment variables)
-WEBHOOK_URL = "https://webhook.site/e1b7bb92-bf8d-42b1-86f4-6c338de6c08d"
-WEBHOOK_SECRET = "super_secret_signing_key_12345"
-API_KEY_SECRET = "my_internal_secret_api_key_789"
-
-# In-memory store for idempotency keys (In production, use Redis or DB table)
+# In-memory store for idempotency keys
 PROCESSED_EVENT_IDS = set()
 
 # ==========================================
-# 2. FASTAPI APP INSTANTIATION
+# 2. OPENAPI TAGS & FASTAPI INSTANTIATION
 # ==========================================
+tags_metadata = [
+    {
+        "name": "Monitoring",
+        "description": "Health check and diagnostic endpoints for operational uptime.",
+    },
+    {
+        "name": "Tickets",
+        "description": "Core CRUD operations for customer support ticket management.",
+    },
+    {
+        "name": "Inbound Webhooks",
+        "description": "Receives and validates incoming event webhooks from external platforms (e.g. Jira, Salesforce).",
+    },
+]
+
 app = FastAPI(
-    title="Enterprise Ticket & Webhook Integration Service",
-    description="Production-ready REST API featuring non-blocking background tasks, HMAC security, retry resilience, and inbound webhook processing.",
-    version="1.1.0"
+    title=settings.app_name,
+    description="Production REST API featuring non-blocking background tasks, HMAC security, retry resilience, and inbound webhook processing.",
+    version="1.2.0",
+    openapi_tags=tags_metadata,
+    docs_url="/docs",
+    redoc_url="/redoc"
+)
+
+# CORS Setup (Allows browser frontends to interact with this API)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # ==========================================
@@ -74,6 +104,9 @@ class InboundWebhookPayload(BaseModel):
 # ==========================================
 # 4. UTILITIES & SECURITY DEPENDENCIES
 # ==========================================
+# Enables Swagger UI "Authorize" button for X-API-Key header authentication
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
 def generate_hmac_signature(payload_bytes: bytes, secret: str) -> str:
     """Generates a SHA-256 HMAC signature to ensure payload integrity."""
     return hmac.new(
@@ -82,9 +115,7 @@ def generate_hmac_signature(payload_bytes: bytes, secret: str) -> str:
         digestmod=hashlib.sha256
     ).hexdigest()
 
-from typing import Optional
-
-def verify_api_key(x_api_key: Optional[str] = Header(None)):
+def verify_api_key(x_api_key: Optional[str] = Depends(api_key_header)):
     """Verifies that incoming requests contain a valid internal API key."""
     if not x_api_key or x_api_key != API_KEY_SECRET:
         logger.warning("Unauthorized access attempt with invalid or missing API key.")
@@ -98,10 +129,7 @@ def verify_api_key(x_api_key: Optional[str] = Header(None)):
 # 5. RESILIENT BACKGROUND TASK WORKER
 # ==========================================
 async def send_webhook_with_retry(payload: dict, max_retries: int = 3):
-    """
-    Background worker that dispatches webhooks with HMAC signatures
-    and exponential backoff retry handling.
-    """
+    """Background worker that dispatches webhooks with HMAC signatures and exponential backoff retries."""
     payload_json = json.dumps(payload)
     signature = generate_hmac_signature(payload_json.encode("utf-8"), WEBHOOK_SECRET)
 
@@ -116,24 +144,23 @@ async def send_webhook_with_retry(payload: dict, max_retries: int = 3):
                 logger.info(f"Webhook delivery attempt {attempt}/{max_retries}...")
                 response = await client.post(WEBHOOK_URL, content=payload_json, headers=headers, timeout=5.0)
                 response.raise_for_status()
-                logger.info(f"Webhook delivered successfully on attempt {attempt}! Status: {response.status_code}")
+                logger.info(f"Webhook delivered successfully! Status: {response.status_code}")
                 return
             except (httpx.HTTPError, httpx.TimeoutException) as exc:
                 logger.warning(f"Attempt {attempt} failed due to: {exc}")
                 if attempt < max_retries:
                     backoff_delay = 2 ** attempt
-                    logger.info(f"Retrying in {backoff_delay} seconds...")
                     await asyncio.sleep(backoff_delay)
                 else:
-                    logger.error(f"Failed to deliver webhook after {max_retries} attempts. Flagging for manual audit.")
+                    logger.error(f"Failed to deliver webhook after {max_retries} attempts.")
 
 # ==========================================
 # 6. REST API ENDPOINTS
 # ==========================================
 @app.get("/health", status_code=status.HTTP_200_OK, tags=["Monitoring"])
 def health_check():
-    """Service health check endpoint for load balancers and monitoring tools."""
-    return {"status": "healthy", "service": "ticket-integration-api", "version": "1.1.0"}
+    """Service health check endpoint for monitoring systems."""
+    return {"status": "healthy", "service": "ticket-integration-api", "version": "1.2.0"}
 
 @app.post("/tickets", response_model=TicketResponse, status_code=status.HTTP_201_CREATED, tags=["Tickets"])
 async def create_ticket(
@@ -142,7 +169,7 @@ async def create_ticket(
     session: Session = Depends(get_session),
     api_key: str = Depends(verify_api_key)
 ):
-    logger.info(f"Processing ticket creation request for: {ticket_in.customer_name}")
+    logger.info(f"Processing ticket creation for: {ticket_in.customer_name}")
 
     normalized_priority = ticket_in.priority.lower().strip()
     if normalized_priority not in ["low", "medium", "high"]:
@@ -223,7 +250,7 @@ def delete_ticket(ticket_id: int, session: Session = Depends(get_session), api_k
     return None
 
 # ==========================================
-# 7. INBOUND WEBHOOK RECEIVER (INCOMING INTEGRATIONS)
+# 7. INBOUND WEBHOOK RECEIVER
 # ==========================================
 @app.post("/webhooks/incoming", status_code=status.HTTP_200_OK, tags=["Inbound Webhooks"])
 async def receive_inbound_webhook(
@@ -232,18 +259,12 @@ async def receive_inbound_webhook(
     x_signature_sha256: str = Header(...),
     session: Session = Depends(get_session)
 ):
-    """
-    Ingests, verifies, and processes inbound webhooks from external third-party systems.
-    Includes HMAC signature validation and idempotency key checks.
-    """
     logger.info(f"Received inbound webhook event '{payload.event_type}' with ID: {payload.event_id}")
 
-    # 1. Idempotency Check: Prevent duplicate processing of the same event
     if payload.event_id in PROCESSED_EVENT_IDS:
-        logger.warning(f"Duplicate event detected: {payload.event_id}. Skipping processing.")
+        logger.warning(f"Duplicate event detected: {payload.event_id}. Skipping.")
         return {"status": "skipped", "message": "Duplicate event ID ignored."}
 
-    # 2. HMAC Signature Verification: Verify the payload body matches the signature
     body_bytes = await request.body()
     computed_signature = generate_hmac_signature(body_bytes, WEBHOOK_SECRET)
     
@@ -251,7 +272,6 @@ async def receive_inbound_webhook(
         logger.error("Inbound webhook HMAC signature mismatch!")
         raise HTTPException(status_code=401, detail="Invalid HMAC signature.")
 
-    # 3. Process business logic (e.g., auto-creating a ticket from incoming system)
     db_ticket = TicketModel(
         customer_name=payload.customer,
         email=payload.email,
@@ -262,8 +282,5 @@ async def receive_inbound_webhook(
     session.add(db_ticket)
     session.commit()
 
-    # 4. Mark event ID as processed
     PROCESSED_EVENT_IDS.add(payload.event_id)
-
-    logger.info(f"Successfully processed inbound event {payload.event_id}. Ticket created.")
     return {"status": "success", "event_id": payload.event_id, "ticket_id": db_ticket.id}

@@ -8,10 +8,11 @@ from sqlmodel.pool import StaticPool
 
 import database
 from database import TicketModel, get_session
-from main import app, API_KEY_SECRET, WEBHOOK_SECRET
+from main import app
+from config import settings
 
 # ==========================================
-# 1. FIXED IN-MEMORY TEST DATABASE SETUP
+# 1. IN-MEMORY TEST DATABASE SETUP
 # StaticPool forces SQLite to share the SAME memory database across sessions
 # ==========================================
 test_engine = create_engine(
@@ -20,7 +21,7 @@ test_engine = create_engine(
     poolclass=StaticPool,
 )
 
-AUTH_HEADERS = {"X-API-Key": API_KEY_SECRET}
+AUTH_HEADERS = {"X-API-Key": settings.api_key_secret}
 
 @pytest.fixture(name="session")
 def session_fixture():
@@ -143,7 +144,7 @@ def test_inbound_webhook_processing_and_idempotency(client: TestClient):
     raw_body_bytes = json.dumps(payload, separators=(',', ':')).encode("utf-8")
     
     signature = hmac.new(
-        key=WEBHOOK_SECRET.encode("utf-8"),
+        key=settings.webhook_secret.encode("utf-8"),
         msg=raw_body_bytes,
         digestmod=hashlib.sha256
     ).hexdigest()
@@ -153,10 +154,12 @@ def test_inbound_webhook_processing_and_idempotency(client: TestClient):
         "Content-Type": "application/json"
     }
 
+    # 1. First execution should succeed
     response = client.post("/webhooks/incoming", content=raw_body_bytes, headers=headers)
     assert response.status_code == 200
     assert response.json()["status"] == "success"
 
+    # 2. Duplicate submission should be safely skipped (Idempotency)
     dup_response = client.post("/webhooks/incoming", content=raw_body_bytes, headers=headers)
     assert dup_response.status_code == 200
     assert dup_response.json()["status"] == "skipped"
