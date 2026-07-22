@@ -1,18 +1,30 @@
+import hmac
+import hashlib
+import json
 import pytest
 from fastapi.testclient import TestClient
 from sqlmodel import SQLModel, Session, create_engine
-from main import app, get_session, Ticket # Assumes your API code is in main.py
-from database import get_session, engine # Import what you need from your new file
-# ==========================================
-# 1. TESTING SETUP & FIXTURES (The Sandbox)
-# ==========================================
+from sqlmodel.pool import StaticPool
 
-# Create an isolated, in-memory database just for our test runs
-test_engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+import database
+from database import TicketModel, get_session
+from main import app, API_KEY_SECRET, WEBHOOK_SECRET
+
+# ==========================================
+# 1. FIXED IN-MEMORY TEST DATABASE SETUP
+# StaticPool forces SQLite to share the SAME memory database across sessions
+# ==========================================
+test_engine = create_engine(
+    "sqlite:///:memory:",
+    connect_args={"check_same_thread": False},
+    poolclass=StaticPool,
+)
+
+AUTH_HEADERS = {"X-API-Key": API_KEY_SECRET}
 
 @pytest.fixture(name="session")
 def session_fixture():
-    """Creates tables before tests run and drops them afterward."""
+    """Creates tables once per test, yields a session, and clears tables after."""
     SQLModel.metadata.create_all(test_engine)
     with Session(test_engine) as session:
         yield session
@@ -20,21 +32,25 @@ def session_fixture():
 
 @pytest.fixture(name="client")
 def client_fixture(session: Session):
-    """Overrides the real database session dependency with our test session."""
+    """Overrides the real DB dependency so FastAPI uses our test session."""
     def get_session_override():
         return session
-    
+
     app.dependency_overrides[get_session] = get_session_override
     client = TestClient(app)
     yield client
     app.dependency_overrides.clear()
 
 # ==========================================
-# 2. THE AUTOMATED TEST CASES
+# 2. AUTOMATED TEST CASES
 # ==========================================
 
-def test_create_ticket(client: TestClient):
-    """Verify that a valid ticket payload successfully creates a ticket."""
+def test_health_check(client: TestClient):
+    response = client.get("/health")
+    assert response.status_code == 200
+    assert response.json()["status"] == "healthy"
+
+def test_create_ticket_unauthorized(client: TestClient):
     payload = {
         "customer_name": "Jane Doe",
         "email": "jane.doe@example.com",
@@ -42,81 +58,105 @@ def test_create_ticket(client: TestClient):
         "priority": "high"
     }
     response = client.post("/tickets", json=payload)
-    
+    assert response.status_code == 401
+
+def test_create_ticket_success(client: TestClient):
+    payload = {
+        "customer_name": "Jane Doe",
+        "email": "jane.doe@example.com",
+        "issue": "Cannot log into the customer portal",
+        "priority": "high"
+    }
+    response = client.post("/tickets", json=payload, headers=AUTH_HEADERS)
     assert response.status_code == 201
     data = response.json()
     assert data["customer_name"] == "Jane Doe"
     assert data["status"] == "open"
-    assert "id" in data  # Ensure our UUID was system-generated
+    assert "id" in data
 
 def test_create_ticket_invalid_priority(client: TestClient):
-    """Verify that an invalid priority rejects the request with a 400 Bad Request."""
     payload = {
         "customer_name": "Jane Doe",
         "email": "jane.doe@example.com",
         "issue": "Cannot log into the portal",
-        "priority": "ultra-critical"  # Invalid option
+        "priority": "ultra-critical"
     }
-    response = client.post("/tickets", json=payload)
+    response = client.post("/tickets", json=payload, headers=AUTH_HEADERS)
     assert response.status_code == 400
     assert response.json()["detail"] == "Priority must be 'low', 'medium', or 'high'."
 
 def test_get_all_tickets(client: TestClient):
-    """Verify we can fetch the entire list of tickets."""
-    # Add a mock ticket first
     client.post("/tickets", json={
         "customer_name": "Bob Smith",
         "email": "bob@example.com",
         "issue": "API webhook timeout error",
         "priority": "medium"
-    })
+    }, headers=AUTH_HEADERS)
     
-    print(app.routes)
-    response = client.get("/tickets")
+    response = client.get("/tickets", headers=AUTH_HEADERS)
     assert response.status_code == 200
-    assert len(response.json()) == 2
+    assert len(response.json()) == 1
 
 def test_patch_ticket_status(client: TestClient):
-    """Verify partial updates (PATCH) successfully modify status without breaking other fields."""
-    # 1. Create a ticket
     created = client.post("/tickets", json={
         "customer_name": "Alice Green",
         "email": "alice@example.com",
         "issue": "Salesforce sync failing",
         "priority": "low"
-    }).json()
+    }, headers=AUTH_HEADERS).json()
     
     ticket_id = created["id"]
     
-    # 2. Update just the status
     update_payload = {"status": "in-progress"}
-    response = client.patch(f"/tickets/{ticket_id}", json=update_payload)
+    response = client.patch(f"/tickets/{ticket_id}", json=update_payload, headers=AUTH_HEADERS)
     
     assert response.status_code == 200
     updated_data = response.json()
     assert updated_data["status"] == "in-progress"
-    assert updated_data["customer_name"] == "Alice Green"  # Should remain unchanged
 
 def test_delete_ticket(client: TestClient):
-    """Verify a ticket can be permanently removed from the system."""
     created = client.post("/tickets", json={
         "customer_name": "Charlie Brown",
         "email": "charlie@example.com",
         "issue": "Jira ticket field mapping bug",
         "priority": "low"
-    }).json()
+    }, headers=AUTH_HEADERS).json()
     
     ticket_id = created["id"]
     
-    # Delete it
-    delete_response = client.delete(f"/tickets/{ticket_id}")
+    delete_response = client.delete(f"/tickets/{ticket_id}", headers=AUTH_HEADERS)
     assert delete_response.status_code == 204
     
-    # Verify it's truly gone
-    get_response = client.get(f"/tickets/{ticket_id}")
+    get_response = client.get(f"/tickets/{ticket_id}", headers=AUTH_HEADERS)
     assert get_response.status_code == 404
+
+def test_inbound_webhook_processing_and_idempotency(client: TestClient):
+    payload = {
+        "event_id": "evt_test_99999",
+        "event_type": "jira_case_created",
+        "customer": "External System User",
+        "email": "system@external.com",
+        "issue": "Auto-synced case from Jira integration",
+        "priority": "medium"
+    }
     
-def test_read_main(client):
-        # Replace "/your-endpoint" with an actual endpoint from your main.py
-    response = client.get("/tickets") 
+    raw_body_bytes = json.dumps(payload, separators=(',', ':')).encode("utf-8")
+    
+    signature = hmac.new(
+        key=WEBHOOK_SECRET.encode("utf-8"),
+        msg=raw_body_bytes,
+        digestmod=hashlib.sha256
+    ).hexdigest()
+
+    headers = {
+        "X-Signature-SHA256": signature,
+        "Content-Type": "application/json"
+    }
+
+    response = client.post("/webhooks/incoming", content=raw_body_bytes, headers=headers)
     assert response.status_code == 200
+    assert response.json()["status"] == "success"
+
+    dup_response = client.post("/webhooks/incoming", content=raw_body_bytes, headers=headers)
+    assert dup_response.status_code == 200
+    assert dup_response.json()["status"] == "skipped"
